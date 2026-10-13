@@ -483,6 +483,80 @@ function setupDatabase() {
     CREATE INDEX IF NOT EXISTS idx_payment_retry_status ON akfu_payment_retry_workflow(workflow_status);
     CREATE INDEX IF NOT EXISTS idx_challenges_user ON akfu_challenges(user_id);
     CREATE INDEX IF NOT EXISTS idx_challenge_metrics_user ON akfu_challenge_metrics(user_id);
+
+    -- Phase 1 Academy System Tables
+    CREATE TABLE IF NOT EXISTS akfu_production_state (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL UNIQUE,
+      current_project_id TEXT,
+      current_department TEXT,
+      last_accessed_at INTEGER,
+      created_at INTEGER,
+      updated_at INTEGER,
+      FOREIGN KEY (user_id) REFERENCES akfu_users(id),
+      FOREIGN KEY (current_project_id) REFERENCES akfu_projects(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS akfu_academy_courses (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      course_number INTEGER,
+      instructor_name TEXT,
+      duration_minutes INTEGER,
+      thumbnail_url TEXT,
+      is_public BOOLEAN DEFAULT 1,
+      created_at INTEGER,
+      updated_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS akfu_academy_lessons (
+      id TEXT PRIMARY KEY,
+      course_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      lesson_number INTEGER,
+      video_url TEXT,
+      video_duration_seconds INTEGER,
+      transcript TEXT,
+      resources TEXT,
+      created_at INTEGER,
+      updated_at INTEGER,
+      FOREIGN KEY (course_id) REFERENCES akfu_academy_courses(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS akfu_academy_progress (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      course_id TEXT NOT NULL,
+      lesson_id TEXT,
+      completion_percentage INTEGER DEFAULT 0,
+      is_completed BOOLEAN DEFAULT 0,
+      completed_at INTEGER,
+      time_spent_seconds INTEGER DEFAULT 0,
+      created_at INTEGER,
+      updated_at INTEGER,
+      FOREIGN KEY (user_id) REFERENCES akfu_users(id),
+      FOREIGN KEY (course_id) REFERENCES akfu_academy_courses(id),
+      FOREIGN KEY (lesson_id) REFERENCES akfu_academy_lessons(id),
+      UNIQUE(user_id, course_id, lesson_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS akfu_wardrobe_outfit_scenes (
+      id TEXT PRIMARY KEY,
+      outfit_id TEXT NOT NULL,
+      scene_id TEXT,
+      scene_description TEXT,
+      created_at INTEGER,
+      FOREIGN KEY (outfit_id) REFERENCES akfu_wardrobe_looks(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_production_state_user ON akfu_production_state(user_id);
+    CREATE INDEX IF NOT EXISTS idx_academy_courses_public ON akfu_academy_courses(is_public);
+    CREATE INDEX IF NOT EXISTS idx_academy_lessons_course ON akfu_academy_lessons(course_id);
+    CREATE INDEX IF NOT EXISTS idx_academy_progress_user ON akfu_academy_progress(user_id);
+    CREATE INDEX IF NOT EXISTS idx_academy_progress_course ON akfu_academy_progress(course_id);
+    CREATE INDEX IF NOT EXISTS idx_wardrobe_scenes_outfit ON akfu_wardrobe_outfit_scenes(outfit_id);
   `);
 }
 
@@ -2345,6 +2419,650 @@ const subscriptionProtectedRoutes = [
   '/api/projects',
   '/api/providers'
 ];
+
+// ============================================================================
+// PHASE 1 ACADEMY SYSTEM ENDPOINTS
+// ============================================================================
+
+// Production State Management
+app.get('/api/state/:userId', (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const userId = c.req.param('userId');
+
+  // Only allow users to get their own state
+  if (userId !== auth.userId) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  try {
+    const state = db.prepare(`
+      SELECT current_project_id, current_department, last_accessed_at
+      FROM akfu_production_state WHERE user_id = ?
+    `).get(userId) as any;
+
+    if (!state) {
+      return c.json({ current_project_id: null, current_department: null });
+    }
+
+    return c.json(state);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post('/api/state/:userId', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const userId = c.req.param('userId');
+  if (userId !== auth.userId) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const body = await c.req.json();
+  const { current_project_id, current_department } = body;
+
+  try {
+    const existing = db.prepare(`
+      SELECT id FROM akfu_production_state WHERE user_id = ?
+    `).get(userId) as any;
+
+    const now = Math.floor(Date.now() / 1000);
+
+    if (existing) {
+      const stmt = db.prepare(`
+        UPDATE akfu_production_state
+        SET current_project_id = ?, current_department = ?, last_accessed_at = ?, updated_at = ?
+        WHERE user_id = ?
+      `);
+      stmt.run(current_project_id, current_department, now, now, userId);
+    } else {
+      const stateId = crypto.randomUUID();
+      const stmt = db.prepare(`
+        INSERT INTO akfu_production_state
+        (id, user_id, current_project_id, current_department, last_accessed_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(stateId, userId, current_project_id, current_department, now, now, now);
+    }
+
+    return c.json({ status: 'updated', current_project_id, current_department });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// Academy Courses
+app.get('/api/academy/courses', (c) => {
+  try {
+    const courses = db.prepare(`
+      SELECT id, title, description, course_number, instructor_name, duration_minutes, thumbnail_url
+      FROM akfu_academy_courses
+      WHERE is_public = 1
+      ORDER BY course_number ASC
+    `).all() as any[];
+
+    return c.json({ courses, total: courses.length });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post('/api/academy/courses', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  // Check admin access (simplified - in production use proper admin flag)
+  const adminKey = c.req.query('admin');
+  if (adminKey !== ADMIN_KEY) {
+    return c.json({ error: 'Admin only' }, 403);
+  }
+
+  const body = await c.req.json();
+  const { title, description, course_number, instructor_name, duration_minutes, thumbnail_url } = body;
+
+  try {
+    const courseId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_academy_courses
+      (id, title, description, course_number, instructor_name, duration_minutes, thumbnail_url, is_public, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(courseId, title, description, course_number, instructor_name, duration_minutes, thumbnail_url, 1, now, now);
+
+    return c.json({
+      id: courseId,
+      title,
+      description,
+      course_number,
+      instructor_name,
+      duration_minutes,
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// Academy Lessons
+app.get('/api/academy/courses/:courseId/lessons', (c) => {
+  const courseId = c.req.param('courseId');
+
+  try {
+    const course = db.prepare(`
+      SELECT id, title FROM akfu_academy_courses WHERE id = ?
+    `).get(courseId) as any;
+
+    if (!course) {
+      return c.json({ error: 'Course not found' }, 404);
+    }
+
+    const lessons = db.prepare(`
+      SELECT id, title, description, lesson_number, video_url, video_duration_seconds, transcript
+      FROM akfu_academy_lessons
+      WHERE course_id = ?
+      ORDER BY lesson_number ASC
+    `).all(courseId) as any[];
+
+    return c.json({ course_id: courseId, course_title: course.title, lessons, total: lessons.length });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post('/api/academy/courses/:courseId/lessons', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const adminKey = c.req.query('admin');
+  if (adminKey !== ADMIN_KEY) {
+    return c.json({ error: 'Admin only' }, 403);
+  }
+
+  const courseId = c.req.param('courseId');
+  const body = await c.req.json();
+  const { title, description, lesson_number, video_url, video_duration_seconds, transcript, resources } = body;
+
+  try {
+    const course = db.prepare(`
+      SELECT id FROM akfu_academy_courses WHERE id = ?
+    `).get(courseId) as any;
+
+    if (!course) {
+      return c.json({ error: 'Course not found' }, 404);
+    }
+
+    const lessonId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_academy_lessons
+      (id, course_id, title, description, lesson_number, video_url, video_duration_seconds, transcript, resources, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(lessonId, courseId, title, description, lesson_number, video_url, video_duration_seconds, transcript, resources, now, now);
+
+    return c.json({
+      id: lessonId,
+      course_id: courseId,
+      title,
+      description,
+      lesson_number,
+      video_url,
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// Academy Progress Tracking
+app.get('/api/academy/progress', (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  try {
+    const progress = db.prepare(`
+      SELECT ap.id, ap.course_id, ac.title as course_title, ap.lesson_id, al.title as lesson_title,
+             ap.completion_percentage, ap.is_completed, ap.completed_at, ap.time_spent_seconds, ap.updated_at
+      FROM akfu_academy_progress ap
+      LEFT JOIN akfu_academy_courses ac ON ap.course_id = ac.id
+      LEFT JOIN akfu_academy_lessons al ON ap.lesson_id = al.id
+      WHERE ap.user_id = ?
+      ORDER BY ap.updated_at DESC
+    `).all(auth.userId) as any[];
+
+    return c.json({ progress });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post('/api/academy/progress', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  const { course_id, lesson_id, completion_percentage, is_completed, time_spent_seconds } = body;
+
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const progressId = crypto.randomUUID();
+
+    const existing = db.prepare(`
+      SELECT id FROM akfu_academy_progress WHERE user_id = ? AND course_id = ? AND lesson_id = ?
+    `).get(auth.userId, course_id, lesson_id) as any;
+
+    if (existing) {
+      const stmt = db.prepare(`
+        UPDATE akfu_academy_progress
+        SET completion_percentage = ?, is_completed = ?, completed_at = ?, time_spent_seconds = time_spent_seconds + ?, updated_at = ?
+        WHERE user_id = ? AND course_id = ? AND lesson_id = ?
+      `);
+      stmt.run(
+        completion_percentage || 0,
+        is_completed ? 1 : 0,
+        is_completed ? now : null,
+        time_spent_seconds || 0,
+        now,
+        auth.userId,
+        course_id,
+        lesson_id
+      );
+    } else {
+      const stmt = db.prepare(`
+        INSERT INTO akfu_academy_progress
+        (id, user_id, course_id, lesson_id, completion_percentage, is_completed, completed_at, time_spent_seconds, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        progressId,
+        auth.userId,
+        course_id,
+        lesson_id,
+        completion_percentage || 0,
+        is_completed ? 1 : 0,
+        is_completed ? now : null,
+        time_spent_seconds || 0,
+        now,
+        now
+      );
+    }
+
+    return c.json({ status: 'recorded', course_id, lesson_id, completion_percentage }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// ============================================================================
+// ENHANCED SCRIPT ENDPOINTS
+// ============================================================================
+
+app.post('/api/scripts/create', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  const { project_id, title, content } = body;
+
+  try {
+    const project = db.prepare(`
+      SELECT * FROM akfu_projects WHERE id = ? AND user_id = ?
+    `).get(project_id, auth.userId) as any;
+
+    if (!project) {
+      return c.json({ error: 'Project not found' }, 404);
+    }
+
+    const scriptId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const sceneCount = content ? (content.match(/INT\.|EXT\./g) || []).length : 0;
+    const pageCount = content ? Math.ceil(content.length / 250) : 0;
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_scripts
+      (id, project_id, user_id, title, content, scene_count, page_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(scriptId, project_id, auth.userId, title, content || '', sceneCount, pageCount, now, now);
+
+    // Create initial version
+    const versionStmt = db.prepare(`
+      INSERT INTO akfu_script_versions
+      (id, script_id, version_number, content, changes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    versionStmt.run(crypto.randomUUID(), scriptId, 1, content || '', 'Initial version', now);
+
+    return c.json({
+      id: scriptId,
+      project_id,
+      title,
+      scene_count: sceneCount,
+      page_count: pageCount,
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.put('/api/scripts/:scriptId/content', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const scriptId = c.req.param('scriptId');
+  const body = await c.req.json();
+  const { content, change_description } = body;
+
+  try {
+    const script = db.prepare(`
+      SELECT * FROM akfu_scripts WHERE id = ? AND user_id = ?
+    `).get(scriptId, auth.userId) as any;
+
+    if (!script) {
+      return c.json({ error: 'Script not found' }, 404);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const sceneCount = content ? (content.match(/INT\.|EXT\./g) || []).length : script.scene_count;
+    const pageCount = content ? Math.ceil(content.length / 250) : script.page_count;
+
+    // Update script
+    const updateStmt = db.prepare(`
+      UPDATE akfu_scripts
+      SET content = ?, scene_count = ?, page_count = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `);
+    updateStmt.run(content, sceneCount, pageCount, now, scriptId, auth.userId);
+
+    // Create new version
+    const latestVersion = db.prepare(`
+      SELECT version_number FROM akfu_script_versions WHERE script_id = ? ORDER BY version_number DESC LIMIT 1
+    `).get(scriptId) as any;
+
+    const nextVersion = (latestVersion?.version_number || 0) + 1;
+    const versionStmt = db.prepare(`
+      INSERT INTO akfu_script_versions
+      (id, script_id, version_number, content, changes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    versionStmt.run(crypto.randomUUID(), scriptId, nextVersion, content, change_description || '', now);
+
+    return c.json({
+      id: scriptId,
+      version: nextVersion,
+      scene_count: sceneCount,
+      page_count: pageCount,
+      updated_at: now
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.get('/api/scripts/:scriptId/versions', (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const scriptId = c.req.param('scriptId');
+
+  try {
+    const script = db.prepare(`
+      SELECT * FROM akfu_scripts WHERE id = ? AND user_id = ?
+    `).get(scriptId, auth.userId) as any;
+
+    if (!script) {
+      return c.json({ error: 'Script not found' }, 404);
+    }
+
+    const versions = db.prepare(`
+      SELECT id, version_number, changes, created_at
+      FROM akfu_script_versions
+      WHERE script_id = ?
+      ORDER BY version_number DESC
+    `).all(scriptId) as any[];
+
+    return c.json({ script_id: scriptId, versions });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// ============================================================================
+// ENHANCED CHARACTER ENDPOINTS
+// ============================================================================
+
+app.post('/api/characters/create', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  const { project_id, name, description, personality, appearance } = body;
+
+  try {
+    const project = db.prepare(`
+      SELECT * FROM akfu_projects WHERE id = ? AND user_id = ?
+    `).get(project_id, auth.userId) as any;
+
+    if (!project) {
+      return c.json({ error: 'Project not found' }, 404);
+    }
+
+    const characterId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_characters
+      (id, project_id, user_id, name, description, personality, appearance, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(characterId, project_id, auth.userId, name, description, personality, appearance, 'active', now, now);
+
+    return c.json({
+      id: characterId,
+      project_id,
+      name,
+      description,
+      personality,
+      appearance,
+      status: 'active',
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.put('/api/characters/:characterId', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const characterId = c.req.param('characterId');
+  const body = await c.req.json();
+
+  try {
+    const character = db.prepare(`
+      SELECT * FROM akfu_characters WHERE id = ? AND user_id = ?
+    `).get(characterId, auth.userId) as any;
+
+    if (!character) {
+      return c.json({ error: 'Character not found' }, 404);
+    }
+
+    const stmt = db.prepare(`
+      UPDATE akfu_characters
+      SET name = ?, description = ?, personality = ?, appearance = ?, voice_id = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `);
+
+    const now = Math.floor(Date.now() / 1000);
+    stmt.run(
+      body.name || character.name,
+      body.description || character.description,
+      body.personality || character.personality,
+      body.appearance || character.appearance,
+      body.voice_id || character.voice_id,
+      now,
+      characterId,
+      auth.userId
+    );
+
+    return c.json({ id: characterId, status: 'updated', updated_at: now });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post('/api/characters/:characterId/reference-images', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const characterId = c.req.param('characterId');
+  const body = await c.req.json();
+  const { image_url, description } = body;
+
+  try {
+    const character = db.prepare(`
+      SELECT * FROM akfu_characters WHERE id = ? AND user_id = ?
+    `).get(characterId, auth.userId) as any;
+
+    if (!character) {
+      return c.json({ error: 'Character not found' }, 404);
+    }
+
+    const refId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_character_references
+      (id, character_id, image_url, description, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(refId, characterId, image_url, description, now);
+
+    return c.json({
+      id: refId,
+      character_id: characterId,
+      image_url,
+      description,
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// ============================================================================
+// ENHANCED WARDROBE ENDPOINTS
+// ============================================================================
+
+app.post('/api/wardrobe/outfits/create', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  const { project_id, name, description, style_category, color_palette, image_url } = body;
+
+  try {
+    const project = db.prepare(`
+      SELECT * FROM akfu_projects WHERE id = ? AND user_id = ?
+    `).get(project_id, auth.userId) as any;
+
+    if (!project) {
+      return c.json({ error: 'Project not found' }, 404);
+    }
+
+    const outfitId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_wardrobe_looks
+      (id, project_id, user_id, name, description, style_category, color_palette, image_url, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(outfitId, project_id, auth.userId, name, description, style_category, color_palette, image_url, now, now);
+
+    return c.json({
+      id: outfitId,
+      project_id,
+      name,
+      description,
+      style_category,
+      color_palette,
+      image_url,
+      created_at: now
+    }, 201);
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.put('/api/wardrobe/outfits/:outfitId/assign-scene', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const auth = authMiddleware(authHeader);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const outfitId = c.req.param('outfitId');
+  const body = await c.req.json();
+  const { scene_id, scene_description } = body;
+
+  try {
+    const outfit = db.prepare(`
+      SELECT * FROM akfu_wardrobe_looks WHERE id = ? AND user_id = ?
+    `).get(outfitId, auth.userId) as any;
+
+    if (!outfit) {
+      return c.json({ error: 'Outfit not found' }, 404);
+    }
+
+    const assignmentId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    const stmt = db.prepare(`
+      INSERT INTO akfu_wardrobe_outfit_scenes
+      (id, outfit_id, scene_id, scene_description, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(assignmentId, outfitId, scene_id, scene_description, now);
+
+    return c.json({
+      id: assignmentId,
+      outfit_id: outfitId,
+      scene_id,
+      scene_description,
+      created_at: now
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
 
 // ============================================================================
 // ERROR HANDLING
