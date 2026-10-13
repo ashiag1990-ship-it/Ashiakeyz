@@ -1,0 +1,22 @@
+{
+  "name": "akfu-backend",
+  "version": "1.0.0",
+  "description": "Ashia Keyz Film University - Backend API",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run akfu-backend.ts",
+    "start": "bun run akfu-backend.ts",
+    "build": "bun build akfu-backend.ts --outfile=dist/backend.js",
+    "deploy": "bun build akfu-backend.ts --outfile=dist/backend.js && railway deploy"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "crypto": "builtin"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "engine": {
+    "bun": ">=1.0.0"
+  }
+}
