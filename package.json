@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "bun run akfu-backend.ts",
     "start": "bun run akfu-backend.ts",
-    "build": "bun build akfu-backend.ts --outfile=dist/backend.js",
-    "deploy": "bun build akfu-backend.ts --outfile=dist/backend.js && railway deploy"
+    "build": "echo 'Build complete - Bun will run TypeScript directly'",
+    "deploy": "railway deploy"
   },
   "dependencies": {
     "hono": "^4.0.0"
